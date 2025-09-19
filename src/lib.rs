@@ -8,9 +8,9 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 // ...existing code...
-use walkdir::WalkDir;
-use zip::{write::FileOptions, ZipArchive, ZipWriter};
 use thiserror::Error;
+use walkdir::WalkDir;
+use zip::{ZipArchive, ZipWriter};
 
 #[derive(Error, Debug)]
 pub enum MergeError {
@@ -39,7 +39,9 @@ impl std::str::FromStr for OverwritePolicy {
         match s.to_ascii_lowercase().as_str() {
             "last" | "lastwins" | "last_wins" => Ok(OverwritePolicy::LastWins),
             "first" | "firstwins" | "first_wins" => Ok(OverwritePolicy::FirstWins),
-            "error" | "errorifconflict" | "error_if_conflict" => Ok(OverwritePolicy::ErrorIfConflict),
+            "error" | "errorifconflict" | "error_if_conflict" => {
+                Ok(OverwritePolicy::ErrorIfConflict)
+            }
             "skip" | "skipifexists" | "skip_if_exists" => Ok(OverwritePolicy::SkipIfExists),
             other => Err(format!("unknown overwrite policy: {}", other)),
         }
@@ -105,11 +107,18 @@ impl From<String> for PackInput {
 
 /// Download a URL and return bytes (blocking reqwest). Caller should handle large bodies.
 fn fetch_url_bytes(url: &str) -> Result<Vec<u8>> {
-    let resp = reqwest::blocking::get(url).map_err(|e| MergeError::InvalidInput(format!("failed to GET {}: {}", url, e)))?;
+    let resp = reqwest::blocking::get(url)
+        .map_err(|e| MergeError::InvalidInput(format!("failed to GET {}: {}", url, e)))?;
     if !resp.status().is_success() {
-        return Err(MergeError::InvalidInput(format!("GET {} returned {}", url, resp.status())));
+        return Err(MergeError::InvalidInput(format!(
+            "GET {} returned {}",
+            url,
+            resp.status()
+        )));
     }
-    let bytes = resp.bytes().map_err(|e| MergeError::InvalidInput(format!("read {} body: {}", url, e)))?;
+    let bytes = resp
+        .bytes()
+        .map_err(|e| MergeError::InvalidInput(format!("read {} body: {}", url, e)))?;
     Ok(bytes.to_vec())
 }
 
@@ -136,7 +145,8 @@ pub fn merge_packs_to_bytes(packs: &[PackInput]) -> Result<Vec<u8>> {
     // Write map into an in-memory zip
     let buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(buffer);
-    let options = FileOptions::default().unix_permissions(0o644);
+    let options: zip::write::FileOptions<'_, zip::write::ExtendedFileOptions> =
+        zip::write::FileOptions::default().unix_permissions(0o644);
 
     // Ensure deterministic order by sorting keys
     let mut keys: Vec<&String> = files.keys().collect();
@@ -144,7 +154,7 @@ pub fn merge_packs_to_bytes(packs: &[PackInput]) -> Result<Vec<u8>> {
 
     for key in keys {
         let data = &files[key];
-        zip.start_file(key, options)?;
+        zip.start_file(key, options.clone())?;
         zip.write_all(data)?;
     }
 
@@ -164,7 +174,11 @@ pub fn merge_packs_to_file<P: AsRef<Path>>(packs: &[PackInput], out: P) -> Resul
 }
 
 /// Merge with options and write to file. Currently uses the in-memory path when appropriate.
-pub fn merge_packs_to_file_with_options<P: AsRef<Path>>(packs: &[PackInput], out: P, opts: &MergeOptions) -> Result<()> {
+pub fn merge_packs_to_file_with_options<P: AsRef<Path>>(
+    packs: &[PackInput],
+    out: P,
+    opts: &MergeOptions,
+) -> Result<()> {
     // For now, if dry_run just compute plan via merge_packs_to_bytes read-only scan
     if opts.dry_run {
         // perform a simple scan to validate inputs and return early (no writes)
@@ -180,7 +194,11 @@ pub fn merge_packs_to_file_with_options<P: AsRef<Path>>(packs: &[PackInput], out
 
 /// Streaming merge into a directory. This is a placeholder that currently falls back to in-memory behavior
 /// for backwards compatibility. Later this should stream per-file into `out_dir` following `opts`.
-pub fn merge_packs_to_dir<P: AsRef<Path>>(packs: &[PackInput], out_dir: P, opts: &MergeOptions) -> Result<()> {
+pub fn merge_packs_to_dir<P: AsRef<Path>>(
+    packs: &[PackInput],
+    out_dir: P,
+    opts: &MergeOptions,
+) -> Result<()> {
     // TODO: implement streaming plan+execute.
     if opts.dry_run {
         // validate by scanning using existing in-memory method
@@ -214,9 +232,15 @@ pub fn merge_packs_to_dir<P: AsRef<Path>>(packs: &[PackInput], out_dir: P, opts:
 /// lexical order. Useful when users supply a single "resourcepacks" folder.
 pub fn merge_all_packs_in_folder(folder: &Path) -> Result<Vec<u8>> {
     if !folder.is_dir() {
-        return Err(MergeError::InvalidInput(format!("{} is not a dir", folder.display())));
+        return Err(MergeError::InvalidInput(format!(
+            "{} is not a dir",
+            folder.display()
+        )));
     }
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(folder)?.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(folder)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
     entries.sort();
     let packs: Vec<PackInput> = entries.into_iter().map(|p| p.into()).collect();
     merge_packs_to_bytes(&packs)
@@ -238,7 +262,10 @@ pub fn read_config_file(path: &Path) -> Result<Vec<PackInput>> {
 
 fn read_dir_into_map(dir: &Path, map: &mut HashMap<String, Vec<u8>>) -> Result<()> {
     if !dir.is_dir() {
-        return Err(MergeError::InvalidInput(format!("{} is not a directory", dir.display())));
+        return Err(MergeError::InvalidInput(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
     }
 
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
@@ -246,7 +273,11 @@ fn read_dir_into_map(dir: &Path, map: &mut HashMap<String, Vec<u8>>) -> Result<(
         if path.is_file() {
             let rel = path.strip_prefix(dir).unwrap();
             // Use forward slashes as zip paths
-            let key = rel.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("/");
+            let key = rel
+                .iter()
+                .map(|p| p.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             let mut f = File::open(path)?;
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
@@ -311,7 +342,10 @@ mod tests {
         let mut cursor = Cursor::new(Vec::new());
         {
             let mut zw = ZipWriter::new(&mut cursor);
-            zw.start_file("assets/test/b.txt", FileOptions::default())?;
+            zw.start_file(
+                "assets/test/b.txt",
+                zip::write::FileOptions::<zip::write::ExtendedFileOptions>::default(),
+            )?;
             zw.write_all(b"fromzip")?;
             zw.finish()?;
         }

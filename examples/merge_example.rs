@@ -1,4 +1,4 @@
-use resource_merger::{merge_packs_to_bytes, PackInput};
+use resource_merger::{PackInput, merge_packs_to_bytes};
 use std::fs::write;
 use std::path::PathBuf;
 
