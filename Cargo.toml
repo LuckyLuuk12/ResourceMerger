@@ -1,0 +1,21 @@
+[package]
+name = "resource_merger"
+version = "0.1.0"
+edition = "2024"
+description = "Merge multiple Minecraft resource packs (directories or zip files/bytes) into a single zip where later packs overwrite earlier ones."
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/yourname/resource_merger"
+keywords = ["minecraft", "resourcepack", "resource-packs", "zip", "merge"]
+categories = ["compression", "command-line-utilities"]
+
+[dependencies]
+zip = "0.6"
+walkdir = "2.3"
+thiserror = "1.0"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
+
+[dev-dependencies]
+anyhow = "1.0"
