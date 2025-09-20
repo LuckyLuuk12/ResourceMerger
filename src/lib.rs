@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 // ...existing code...
-use base64::Engine;
+// ...existing code...
 use thiserror::Error;
 use walkdir::WalkDir;
 use zip::{ZipArchive, ZipWriter};
@@ -343,11 +343,11 @@ pub fn merge_packs_to_bytes_with_options(
     zip.write_all(mcmeta.as_bytes())?;
 
     // Ensure pack.png exists (small default) if missing
-    if !files.contains_key("pack.png") {
-        let png = default_pack_png_bytes();
-        zip.start_file("pack.png", options.clone())?;
-        zip.write_all(&png)?;
-    }
+    // Always write our embedded default pack.png into the merged zip as pack.png.
+    // This ensures a consistent default image regardless of input packs.
+    let png = default_pack_png_bytes();
+    zip.start_file("pack.png", options.clone())?;
+    zip.write_all(&png)?;
 
     // Ensure README.md exists with simple generation notes
     if !files.contains_key("README.md") {
@@ -415,8 +415,20 @@ pub fn merge_packs_to_dir<P: AsRef<Path>>(
         if file.is_dir() {
             continue;
         }
-        let name = file.name().to_string();
-        let dest = out_path.join(name);
+        let raw_name = file.name().to_string();
+        let name = match sanitize_zip_entry_name(&raw_name) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Build a destination path from the sanitized components to ensure correct
+        // OS-specific separators and avoid zip-slip.
+        let dest = {
+            let mut p = out_path.to_path_buf();
+            for comp in name.split('/') {
+                p.push(comp);
+            }
+            p
+        };
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -549,6 +561,11 @@ fn read_zipfile_into_map(path: &Path, map: &mut HashMap<String, Vec<u8>>) -> Res
             continue;
         }
         let name = file.name().to_string();
+        // Sanitize zip entry name to a normalized forward-slash form and skip unsafe entries
+        let name = match sanitize_zip_entry_name(&name) {
+            Some(n) => n,
+            None => continue,
+        };
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         map.insert(name, buf);
@@ -565,11 +582,38 @@ fn read_zipbytes_into_map(bytes: &[u8], map: &mut HashMap<String, Vec<u8>>) -> R
             continue;
         }
         let name = file.name().to_string();
+        let name = match sanitize_zip_entry_name(&name) {
+            Some(n) => n,
+            None => continue,
+        };
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         map.insert(name, buf);
     }
     Ok(())
+}
+
+/// Normalize a zip entry name into a safe forward-slash form suitable for
+/// using as a zip path and for converting into OS paths when extracting.
+/// Returns None for absolute paths or entries that attempt to traverse up
+/// the filesystem ("..").
+fn sanitize_zip_entry_name(name: &str) -> Option<String> {
+    // Convert any backslashes to forward slashes (some zip writers use them)
+    let n = name.replace('\\', "/");
+    // Reject absolute paths
+    if n.starts_with('/') || n.starts_with("\\") {
+        return None;
+    }
+    // Split and remove any empty components (caused by leading/trailing slashes)
+    let comps: Vec<&str> = n.split('/').filter(|s| !s.is_empty()).collect();
+    // Reject parent-traversal components for safety (zip-slip)
+    if comps.iter().any(|c| *c == "..") {
+        return None;
+    }
+    if comps.is_empty() {
+        return None;
+    }
+    Some(comps.join("/"))
 }
 
 // Peek functions: try to locate pack.mcmeta and extract pack_format without reading all files.
@@ -678,13 +722,11 @@ fn make_pack_mcmeta(
 }
 
 fn default_pack_png_bytes() -> Vec<u8> {
-    // a tiny 1x1 PNG (transparent). Encoded inline for simplicity.
-    // Generated via a tiny base64 1x1 PNG.
-    let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
-    // Use the new Engine API to avoid deprecated function warnings
-    base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .unwrap_or_default()
+    // Include the default 64x64 pack image binary at compile time. This uses the
+    // provided PNG file `assets/default-pack-64.png` and embeds its bytes into
+    // the binary so we can always write `pack.png` when inputs don't provide one.
+    const BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/default-pack-64.png"));
+    BYTES.to_vec()
 }
 
 fn make_readme(packs: &[PackInput]) -> String {
