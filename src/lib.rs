@@ -90,6 +90,8 @@ pub struct MergeOptions {
     pub supported_formats_policy: SupportedFormatsPolicy,
     /// Optional description to use in generated pack.mcmeta
     pub description_override: Option<String>,
+    /// If true, continue when input URLs fail to download or aren't valid zips (warn and skip)
+    pub tolerate_missing_inputs: bool,
 }
 
 impl Default for MergeOptions {
@@ -103,6 +105,7 @@ impl Default for MergeOptions {
             pack_format_override: None,
             supported_formats_policy: SupportedFormatsPolicy::OneToHighest,
             description_override: None,
+            tolerate_missing_inputs: false,
         }
     }
 }
@@ -154,10 +157,29 @@ fn fetch_url_bytes(url: &str) -> Result<Vec<u8>> {
             resp.status()
         )));
     }
+    // Capture content-type header before consuming the response
+    let ct_header = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let bytes = resp
         .bytes()
         .map_err(|e| MergeError::InvalidInput(format!("read {} body: {}", url, e)))?;
-    Ok(bytes.to_vec())
+    let b = bytes.to_vec();
+    // Quick sanity check: ensure the bytes look like a ZIP file (start with PK signature).
+    // Many servers may return HTML error pages or other content; detect that early.
+    if b.len() >= 2 && &b[0..2] == b"PK" {
+        Ok(b)
+    } else {
+        // Try to include content-type header for better debugging
+        let ct = ct_header.as_deref().unwrap_or("<unknown>");
+        Err(MergeError::InvalidInput(format!(
+            "GET {} did not return a zip file (content-type: {}).",
+            url, ct
+        )))
+    }
 }
 
 /// Merge multiple packs into a single zip archive (returned as Vec<u8>).
@@ -178,14 +200,45 @@ pub fn merge_packs_to_bytes_with_options(
     // Track pack_format numbers found in inputs so we can synthesize a sensible pack.mcmeta
     let mut found_formats: Vec<u32> = Vec::new();
 
+    // First, inspect each input for pack.mcmeta to collect pack_format values across all inputs.
+    // We do a best-effort peek so we can choose the HIGHEST pack_format observed, independent
+    // of later overwrites.
     for pack in packs {
         match pack {
-            PackInput::Dir(p) => read_dir_into_map(p, &mut files)?,
-            PackInput::ZipFile(p) => read_zipfile_into_map(p, &mut files)?,
-            PackInput::ZipBytes(b) => read_zipbytes_into_map(b, &mut files)?,
+            PackInput::Dir(p) => {
+                if let Some(n) = peek_pack_format_from_dir(p) {
+                    found_formats.push(n);
+                }
+                read_dir_into_map(p, &mut files)?;
+            }
+            PackInput::ZipFile(p) => {
+                if let Some(n) = peek_pack_format_from_zipfile(p) {
+                    found_formats.push(n);
+                }
+                read_zipfile_into_map(p, &mut files)?;
+            }
+            PackInput::ZipBytes(b) => {
+                if let Some(n) = peek_pack_format_from_zipbytes(b) {
+                    found_formats.push(n);
+                }
+                read_zipbytes_into_map(b, &mut files)?;
+            }
             PackInput::Url(u) => {
-                let bytes = fetch_url_bytes(u)?;
-                read_zipbytes_into_map(&bytes, &mut files)?;
+                match fetch_url_bytes(u) {
+                    Ok(bytes) => {
+                        if let Some(n) = peek_pack_format_from_zipbytes(&bytes) {
+                            found_formats.push(n);
+                        }
+                        read_zipbytes_into_map(&bytes, &mut files)?;
+                    }
+                    Err(e) => {
+                        if opts.tolerate_missing_inputs {
+                            eprintln!("warning: skipping input {}: {}", u, e);
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
     }
@@ -233,7 +286,12 @@ pub fn merge_packs_to_bytes_with_options(
         *found_formats.iter().max().unwrap_or(&1u32)
     };
 
-    // Compute supported_formats vector based on policy
+    // Compute supported_formats vector based on policy.
+    // For user-friendly pack.mcmeta we emit only the endpoint values (lowest/highest)
+    // instead of every integer in the inclusive range. Examples:
+    // - OneToHighest => [1, high]
+    // - LowestToHighest => [low, high]
+    // If low == high we emit a single-element array [low].
     let supported_formats: Vec<u32> = match opts.supported_formats_policy {
         SupportedFormatsPolicy::OneToHighest => {
             let high = if found_formats.is_empty() {
@@ -241,7 +299,11 @@ pub fn merge_packs_to_bytes_with_options(
             } else {
                 *found_formats.iter().max().unwrap_or(&final_pack_fmt)
             };
-            (1..=high).collect()
+            if high <= 1 {
+                vec![1u32]
+            } else {
+                vec![1u32, high]
+            }
         }
         SupportedFormatsPolicy::LowestToHighest => {
             if found_formats.is_empty() {
@@ -249,7 +311,11 @@ pub fn merge_packs_to_bytes_with_options(
             } else {
                 let low = *found_formats.iter().min().unwrap_or(&final_pack_fmt);
                 let high = *found_formats.iter().max().unwrap_or(&final_pack_fmt);
-                (low..=high).collect()
+                if low == high {
+                    vec![low]
+                } else {
+                    vec![low, high]
+                }
             }
         }
         SupportedFormatsPolicy::OneToLatest => {
@@ -259,7 +325,11 @@ pub fn merge_packs_to_bytes_with_options(
             } else {
                 *found_formats.iter().max().unwrap_or(&final_pack_fmt)
             };
-            (1..=high).collect()
+            if high <= 1 {
+                vec![1u32]
+            } else {
+                vec![1u32, high]
+            }
         }
     };
 
@@ -310,12 +380,12 @@ pub fn merge_packs_to_file_with_options<P: AsRef<Path>>(
     // For now, if dry_run just compute plan via merge_packs_to_bytes read-only scan
     if opts.dry_run {
         // perform a simple scan to validate inputs and return early (no writes)
-        let _ = merge_packs_to_bytes(packs)?;
+        let _ = merge_packs_to_bytes_with_options(packs, opts)?;
         return Ok(());
     }
 
     // For small inputs we keep using the in-memory path. We'll add streaming dir-based merging later.
-    let bytes = merge_packs_to_bytes(packs)?;
+    let bytes = merge_packs_to_bytes_with_options(packs, opts)?;
     std::fs::write(out, bytes)?;
     Ok(())
 }
@@ -330,12 +400,12 @@ pub fn merge_packs_to_dir<P: AsRef<Path>>(
     // TODO: implement streaming plan+execute.
     if opts.dry_run {
         // validate by scanning using existing in-memory method
-        let _ = merge_packs_to_bytes(packs)?;
+        let _ = merge_packs_to_bytes_with_options(packs, opts)?;
         return Ok(());
     }
 
     // Fallback: unzip the in-memory merged zip into out_dir.
-    let bytes = merge_packs_to_bytes(packs)?;
+    let bytes = merge_packs_to_bytes_with_options(packs, opts)?;
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor)?;
     let out_path = out_dir.as_ref();
@@ -426,6 +496,8 @@ pub struct Config {
     pub dir: Option<bool>,
     /// Optional description to use for generated pack.mcmeta
     pub description: Option<String>,
+    /// If true, continue when input URLs fail to download or aren't valid zips
+    pub tolerate_missing_inputs: Option<bool>,
 }
 
 /// Read a JSON config file and return a Config structure.
@@ -500,15 +572,82 @@ fn read_zipbytes_into_map(bytes: &[u8], map: &mut HashMap<String, Vec<u8>>) -> R
     Ok(())
 }
 
+// Peek functions: try to locate pack.mcmeta and extract pack_format without reading all files.
+fn peek_pack_format_from_zipbytes(bytes: &[u8]) -> Option<u32> {
+    let cursor = Cursor::new(bytes);
+    if let Ok(mut archive) = ZipArchive::new(cursor) {
+        if let Ok(mut file) = archive.by_name("pack.mcmeta") {
+            let mut buf = String::new();
+            if file.read_to_string(&mut buf).is_ok() {
+                if let Ok(n) = extract_pack_format_from_mcmeta(&buf) {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn peek_pack_format_from_zipfile(path: &Path) -> Option<u32> {
+    if let Ok(f) = File::open(path) {
+        if let Ok(mut archive) = ZipArchive::new(f) {
+            if let Ok(mut file) = archive.by_name("pack.mcmeta") {
+                let mut buf = String::new();
+                if file.read_to_string(&mut buf).is_ok() {
+                    if let Ok(n) = extract_pack_format_from_mcmeta(&buf) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn peek_pack_format_from_dir(dir: &Path) -> Option<u32> {
+    let p = dir.join("pack.mcmeta");
+    if p.is_file() {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            if let Ok(n) = extract_pack_format_from_mcmeta(&s) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 /// Try to extract a single pack_format number from a pack.mcmeta JSON string.
 fn extract_pack_format_from_mcmeta(s: &str) -> std::result::Result<u32, ()> {
-    // Quick and small parser: look for "pack_format": <num>
+    // Quick and tolerant parser: look for "pack_format" as a number or numeric string.
+    // Accept both the common shape { "pack": { "pack_format": N } } and a rare
+    // top-level { "pack_format": N }.
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        // helper to extract numeric from a Value
+        let try_from_value = |val: &serde_json::Value| -> Option<u32> {
+            if let Some(n) = val.as_u64() {
+                return Some(n as u32);
+            }
+            if let Some(s) = val.as_str() {
+                if let Ok(n) = s.parse::<u32>() {
+                    return Some(n);
+                }
+            }
+            None
+        };
+
+        // Check common shape: { "pack": { "pack_format": ... } }
         if let Some(pack) = v.get("pack") {
             if let Some(fmt) = pack.get("pack_format") {
-                if let Some(n) = fmt.as_u64() {
-                    return Ok(n as u32);
+                if let Some(n) = try_from_value(fmt) {
+                    return Ok(n);
                 }
+            }
+        }
+
+        // Fallback: top-level pack_format
+        if let Some(fmt) = v.get("pack_format") {
+            if let Some(n) = try_from_value(fmt) {
+                return Ok(n);
             }
         }
     }

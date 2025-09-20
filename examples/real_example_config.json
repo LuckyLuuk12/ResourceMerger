@@ -16,7 +16,8 @@
   "preserve_timestamps": false,
   "pack_format": null,
   "supported_formats": "one-to-highest",
-  "out": "§cBetter Minecraft.zip",
-  "description": "§6LuckyLuuk_'s recommended Minecraft experience!"
-  ,"dir": false
+  "out": "§dBetter Minecraft.zip",
+  "description": "§5LuckyLuuk_'s recommended Minecraft experience!",
+  "dir": false,
+  "tolerate_missing_inputs": true
 }

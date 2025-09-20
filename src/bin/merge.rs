@@ -23,7 +23,6 @@ struct Args {
 
     /// Input packs (directories, zip files, or URLs). Order matters; later inputs overwrite earlier ones.
     #[arg(
-        required = true,
         value_name = "INPUTS",
         help = "Input packs (directories, zip files, or HTTP/HTTPS URLs). Order matters; later inputs override earlier ones."
     )]
@@ -103,6 +102,9 @@ struct Args {
         help = "Set a custom description for the generated pack.mcmeta (overrides config.description)."
     )]
     description: Option<String>,
+    /// If set, continue when input URLs fail to download or aren't valid zips (warn and skip)
+    #[arg(long, help = "Continue when input URLs fail to download or aren't valid zips (warn and skip).")]
+    tolerate_missing: bool,
 }
 
 fn main() {
@@ -235,6 +237,11 @@ fn main() {
             .description
             .clone()
             .or_else(|| cfg_obj.as_ref().and_then(|c| c.description.clone())),
+        tolerate_missing_inputs: if args.tolerate_missing {
+            true
+        } else {
+            cfg_obj.as_ref().and_then(|c| c.tolerate_missing_inputs).unwrap_or(false)
+        },
     };
     // Determine output path: CLI `--out` takes precedence, otherwise try config `out`.
     let out_path: PathBuf = if let Some(o) = &args.out {
