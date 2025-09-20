@@ -1,0 +1,22 @@
+{
+  "inputs": [
+    "https://cdn.modrinth.com/data/7junW3B9/versions/HC44ldY7/AVPBR%20Retextured%20R5.zip",
+    "https://cdn.modrinth.com/data/50dA9Sha/versions/EkWu7smn/FreshAnimations_v1.10.1.zip",
+    "https://cdn.modrinth.com/data/slufHzC2/versions/BX6pU42f/%2B1.21.3%20Fresh%20Moves%20v3.1.1%20%28With%20Animated%20Eyes%29.zip",
+    "https://cdn.modrinth.com/data/UGEVQ6t9/versions/TQMLlyko/Fancy%20Crops%20v1.2.zip",
+    "https://cdn.modrinth.com/data/O2zhH8n8/versions/sluWV30f/Os'%20Colorful%20Grasses%20%28Mix%29.zip",
+    "https://cdn.modrinth.com/data/uBBepXuH/versions/aW0zpdKJ/animated-items-1.21.7-8%20-%201.5.1.zip",
+    "https://cdn.modrinth.com/data/XSSmFELw/versions/prwQcbVQ/bushy-leaves-1-6-2-1.zip",
+    "https://static.planetminecraft.com/files/resource_media/texture/kubban-s-flowers-e760.zip"
+  ],
+  "overwrite": "last",
+  "dry_run": false,
+  "buffer_size": 32768,
+  "atomic": true,
+  "preserve_timestamps": false,
+  "pack_format": null,
+  "supported_formats": "one-to-highest",
+  "out": "§cBetter Minecraft.zip",
+  "description": "§6LuckyLuuk_'s recommended Minecraft experience!"
+  ,"dir": false
+}

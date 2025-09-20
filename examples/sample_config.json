@@ -1,0 +1,15 @@
+{
+  "inputs": [
+    "C:/Users/Example/packs/base_pack",
+    "C:/Users/Example/packs/override_pack.zip",
+    "https://example.com/packs/extra_resources.zip"
+  ],
+  "overwrite": "last",
+  "dry_run": false,
+  "buffer_size": 32768,
+  "atomic": true,
+  "preserve_timestamps": false,
+  "pack_format": 34,
+  "supported_formats": "one-to-highest"
+  ,"dir": false
+}

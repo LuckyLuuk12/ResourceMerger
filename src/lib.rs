@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 // ...existing code...
+use base64::Engine;
 use thiserror::Error;
 use walkdir::WalkDir;
 use zip::{ZipArchive, ZipWriter};
@@ -33,6 +34,33 @@ pub enum OverwritePolicy {
     SkipIfExists,
 }
 
+/// How to synthesize the supported_formats array in pack.mcmeta
+#[derive(Debug, Clone, Copy)]
+pub enum SupportedFormatsPolicy {
+    /// [1, highest_found]
+    OneToHighest,
+    /// [lowest_found, highest_found]
+    LowestToHighest,
+    /// [1, latest_known] - not implemented: falls back to OneToHighest
+    OneToLatest,
+}
+
+impl std::str::FromStr for SupportedFormatsPolicy {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "one-to-highest" | "one_to_highest" | "1-to-highest" | "1-to-high" | "one" => {
+                Ok(SupportedFormatsPolicy::OneToHighest)
+            }
+            "lowest-to-highest" | "lowest_to_highest" | "lowest" => {
+                Ok(SupportedFormatsPolicy::LowestToHighest)
+            }
+            "one-to-latest" | "one_to_latest" => Ok(SupportedFormatsPolicy::OneToLatest),
+            other => Err(format!("unknown supported formats policy: {}", other)),
+        }
+    }
+}
+
 impl std::str::FromStr for OverwritePolicy {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -56,6 +84,12 @@ pub struct MergeOptions {
     pub buffer_size: usize,
     pub atomic: bool,
     pub preserve_timestamps: bool,
+    /// If set, force this pack_format in generated pack.mcmeta
+    pub pack_format_override: Option<u32>,
+    /// How to synthesize supported_formats in pack.mcmeta
+    pub supported_formats_policy: SupportedFormatsPolicy,
+    /// Optional description to use in generated pack.mcmeta
+    pub description_override: Option<String>,
 }
 
 impl Default for MergeOptions {
@@ -66,11 +100,15 @@ impl Default for MergeOptions {
             buffer_size: 32 * 1024,
             atomic: true,
             preserve_timestamps: false,
+            pack_format_override: None,
+            supported_formats_policy: SupportedFormatsPolicy::OneToHighest,
+            description_override: None,
         }
     }
 }
 
 /// Represents an input pack. It can be a directory on disk, a zip file on disk, or raw zip bytes.
+#[derive(Debug, Clone)]
 pub enum PackInput {
     Dir(PathBuf),
     ZipFile(PathBuf),
@@ -127,8 +165,18 @@ fn fetch_url_bytes(url: &str) -> Result<Vec<u8>> {
 /// The order of `packs` matters: earlier packs form the base, later packs overwrite files with the
 /// same path.
 pub fn merge_packs_to_bytes(packs: &[PackInput]) -> Result<Vec<u8>> {
+    // Backwards-compatible wrapper: use default options
+    merge_packs_to_bytes_with_options(packs, &MergeOptions::default())
+}
+
+pub fn merge_packs_to_bytes_with_options(
+    packs: &[PackInput],
+    opts: &MergeOptions,
+) -> Result<Vec<u8>> {
     // We'll maintain a map of path -> file bytes. Later packs overwrite earlier ones.
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+    // Track pack_format numbers found in inputs so we can synthesize a sensible pack.mcmeta
+    let mut found_formats: Vec<u32> = Vec::new();
 
     for pack in packs {
         match pack {
@@ -142,6 +190,17 @@ pub fn merge_packs_to_bytes(packs: &[PackInput]) -> Result<Vec<u8>> {
         }
     }
 
+    // Inspect any pack.mcmeta files found and collect pack_format values
+    for (k, v) in &files {
+        if k == "pack.mcmeta" || k.ends_with("/pack.mcmeta") {
+            if let Ok(s) = std::str::from_utf8(v) {
+                if let Ok(vn) = extract_pack_format_from_mcmeta(s) {
+                    found_formats.push(vn);
+                }
+            }
+        }
+    }
+
     // Write map into an in-memory zip
     let buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(buffer);
@@ -149,13 +208,82 @@ pub fn merge_packs_to_bytes(packs: &[PackInput]) -> Result<Vec<u8>> {
         zip::write::FileOptions::default().unix_permissions(0o644);
 
     // Ensure deterministic order by sorting keys
-    let mut keys: Vec<&String> = files.keys().collect();
+    // We'll skip certain auto-generated names when emitting from the map so we can synthesize them
+    let mut keys: Vec<&String> = files
+        .keys()
+        .filter(|k| {
+            let kk = k.as_str();
+            kk != "pack.mcmeta" && kk != "pack.png" && kk != "README.md"
+        })
+        .collect();
     keys.sort();
 
     for key in keys {
         let data = &files[key];
         zip.start_file(key, options.clone())?;
         zip.write_all(data)?;
+    }
+
+    // Determine final pack_format: override via opts if present, otherwise highest found or 1
+    let final_pack_fmt = if let Some(ov) = opts.pack_format_override {
+        ov
+    } else if found_formats.is_empty() {
+        1u32
+    } else {
+        *found_formats.iter().max().unwrap_or(&1u32)
+    };
+
+    // Compute supported_formats vector based on policy
+    let supported_formats: Vec<u32> = match opts.supported_formats_policy {
+        SupportedFormatsPolicy::OneToHighest => {
+            let high = if found_formats.is_empty() {
+                final_pack_fmt
+            } else {
+                *found_formats.iter().max().unwrap_or(&final_pack_fmt)
+            };
+            (1..=high).collect()
+        }
+        SupportedFormatsPolicy::LowestToHighest => {
+            if found_formats.is_empty() {
+                vec![final_pack_fmt]
+            } else {
+                let low = *found_formats.iter().min().unwrap_or(&final_pack_fmt);
+                let high = *found_formats.iter().max().unwrap_or(&final_pack_fmt);
+                (low..=high).collect()
+            }
+        }
+        SupportedFormatsPolicy::OneToLatest => {
+            // Not implemented: fall back to OneToHighest for now
+            let high = if found_formats.is_empty() {
+                final_pack_fmt
+            } else {
+                *found_formats.iter().max().unwrap_or(&final_pack_fmt)
+            };
+            (1..=high).collect()
+        }
+    };
+
+    // Ensure pack.mcmeta exists with an appropriate pack_format & supported_formats
+    let mcmeta = make_pack_mcmeta(
+        final_pack_fmt,
+        &supported_formats,
+        opts.description_override.as_deref(),
+    );
+    zip.start_file("pack.mcmeta", options.clone())?;
+    zip.write_all(mcmeta.as_bytes())?;
+
+    // Ensure pack.png exists (small default) if missing
+    if !files.contains_key("pack.png") {
+        let png = default_pack_png_bytes();
+        zip.start_file("pack.png", options.clone())?;
+        zip.write_all(&png)?;
+    }
+
+    // Ensure README.md exists with simple generation notes
+    if !files.contains_key("README.md") {
+        let readme = make_readme(packs);
+        zip.start_file("README.md", options.clone())?;
+        zip.write_all(readme.as_bytes())?;
     }
 
     let writer = zip.finish()?;
@@ -246,18 +374,71 @@ pub fn merge_all_packs_in_folder(folder: &Path) -> Result<Vec<u8>> {
     merge_packs_to_bytes(&packs)
 }
 
-/// Read a simple config file (one URL or path per line, comments start with #) and return PackInput list
-pub fn read_config_file(path: &Path) -> Result<Vec<PackInput>> {
-    let s = std::fs::read_to_string(path)?;
-    let mut out = Vec::new();
-    for line in s.lines() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
-        }
-        out.push(PackInput::from(t.to_string()));
+/// Settings that represent the full runtime configuration for a merge run.
+/// This mirrors the CLI args/config file and is the single object used to execute a merge.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    /// Ordered list of inputs (directories, zip files, or URLs). These are applied in order.
+    pub inputs: Vec<PackInput>,
+    /// Output path (file or directory) - resolved by the caller
+    pub out: PathBuf,
+    /// If true, write to a directory instead of a zip file
+    pub dir: bool,
+    /// Merge behavior options
+    pub options: MergeOptions,
+}
+
+/// Execute a merge according to `Settings`.
+/// This is the single entrypoint consumers (like the CLI) should call.
+pub fn run_with_settings(settings: &Settings) -> Result<()> {
+    if settings.dir {
+        merge_packs_to_dir(&settings.inputs, &settings.out, &settings.options)
+    } else {
+        merge_packs_to_file_with_options(&settings.inputs, &settings.out, &settings.options)
     }
-    Ok(out)
+}
+
+/// Read a simple config file (one URL or path per line, comments start with #) and return PackInput list
+use serde::Deserialize;
+
+/// Configuration structure for JSON config files.
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    /// Ordered list of inputs (directories, zip files, or URLs). These are applied first.
+    pub inputs: Option<Vec<String>>,
+    /// Overwrite policy: last, first, error, skip
+    pub overwrite: Option<String>,
+    /// Dry run
+    pub dry_run: Option<bool>,
+    /// Buffer size
+    pub buffer_size: Option<usize>,
+    /// Atomic write
+    pub atomic: Option<bool>,
+    /// Preserve timestamps
+    pub preserve_timestamps: Option<bool>,
+    /// Force pack_format
+    pub pack_format: Option<u32>,
+    /// Supported formats policy: one-to-highest, lowest-to-highest, one-to-latest
+    pub supported_formats: Option<String>,
+    /// Optional output path if you want the config to specify a default output file
+    pub out: Option<String>,
+    /// If true, write output as a directory instead of a zip file
+    pub dir: Option<bool>,
+    /// Optional description to use for generated pack.mcmeta
+    pub description: Option<String>,
+}
+
+/// Read a JSON config file and return a Config structure.
+pub fn read_config_file(path: &Path) -> Result<Config> {
+    let s = std::fs::read_to_string(path)?;
+    let cfg: Config = serde_json::from_str(&s).map_err(|e| {
+        MergeError::InvalidInput(format!(
+            "failed to parse JSON config {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    Ok(cfg)
 }
 
 fn read_dir_into_map(dir: &Path, map: &mut HashMap<String, Vec<u8>>) -> Result<()> {
@@ -317,6 +498,81 @@ fn read_zipbytes_into_map(bytes: &[u8], map: &mut HashMap<String, Vec<u8>>) -> R
         map.insert(name, buf);
     }
     Ok(())
+}
+
+/// Try to extract a single pack_format number from a pack.mcmeta JSON string.
+fn extract_pack_format_from_mcmeta(s: &str) -> std::result::Result<u32, ()> {
+    // Quick and small parser: look for "pack_format": <num>
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        if let Some(pack) = v.get("pack") {
+            if let Some(fmt) = pack.get("pack_format") {
+                if let Some(n) = fmt.as_u64() {
+                    return Ok(n as u32);
+                }
+            }
+        }
+    }
+    Err(())
+}
+
+fn make_pack_mcmeta(
+    pack_format: u32,
+    supported_formats: &[u32],
+    description: Option<&str>,
+) -> String {
+    let desc = description.map(|s| s.to_string()).unwrap_or_else(|| {
+        format!(
+            "Made with Rust API: resource_merger:{}",
+            env!("CARGO_PKG_VERSION")
+        )
+    });
+    let meta = serde_json::json!({
+        "pack": {
+            "pack_format": pack_format,
+            "description": desc,
+            "supported_formats": supported_formats
+        }
+    });
+    serde_json::to_string_pretty(&meta).unwrap_or_else(|_| {
+        "{\"pack\":{\"pack_format\":1,\"description\":\"resource_merger\"}}".to_string()
+    })
+}
+
+fn default_pack_png_bytes() -> Vec<u8> {
+    // a tiny 1x1 PNG (transparent). Encoded inline for simplicity.
+    // Generated via a tiny base64 1x1 PNG.
+    let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
+    // Use the new Engine API to avoid deprecated function warnings
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap_or_default()
+}
+
+fn make_readme(packs: &[PackInput]) -> String {
+    let mut out = String::new();
+    out.push_str("This resource pack was generated by resource_merger.\n\n");
+    out.push_str("Inputs used (in order, first -> last):\n");
+    for p in packs {
+        match p {
+            PackInput::Dir(pb) => {
+                out.push_str(&format!("- Dir: {}\n", pb.display()));
+            }
+            PackInput::ZipFile(pb) => {
+                out.push_str(&format!("- ZipFile: {}\n", pb.display()));
+            }
+            PackInput::ZipBytes(_) => {
+                out.push_str("- ZipBytes: <in-memory>\n");
+            }
+            PackInput::Url(u) => {
+                out.push_str(&format!("- Url: {}\n", u));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\nGenerated with resource_merger {}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    out
 }
 
 #[cfg(test)]
