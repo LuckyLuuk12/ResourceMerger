@@ -1,6 +1,6 @@
 [package]
 name = "resource_merger"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Merge multiple Minecraft resource packs (directories or zip files/bytes) into a single zip where later packs overwrite earlier ones."
 readme = "README.md"

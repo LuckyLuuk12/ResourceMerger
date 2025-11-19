@@ -607,7 +607,7 @@ fn sanitize_zip_entry_name(name: &str) -> Option<String> {
     // Split and remove any empty components (caused by leading/trailing slashes)
     let comps: Vec<&str> = n.split('/').filter(|s| !s.is_empty()).collect();
     // Reject parent-traversal components for safety (zip-slip)
-    if comps.iter().any(|c| *c == "..") {
+    if comps.contains(&"..") {
         return None;
     }
     if comps.is_empty() {
@@ -709,15 +709,41 @@ fn make_pack_mcmeta(
             env!("CARGO_PKG_VERSION")
         )
     });
-    let meta = serde_json::json!({
-        "pack": {
-            "pack_format": pack_format,
-            "description": desc,
-            "supported_formats": supported_formats
-        }
-    });
+    
+    // Threshold for backwards compatibility: resource pack format < 65 requires old format
+    const OLD_FORMAT_THRESHOLD: u32 = 65;
+    
+    // Determine min and max from supported_formats array
+    let min_format = supported_formats.first().copied().unwrap_or(pack_format);
+    let max_format = supported_formats.last().copied().unwrap_or(pack_format);
+    
+    // Check if we need backwards compatibility fields (if min_format < 65)
+    let needs_old_format = min_format < OLD_FORMAT_THRESHOLD;
+    
+    let meta = if needs_old_format {
+        // Old format: include pack_format and supported_formats for backwards compatibility
+        serde_json::json!({
+            "pack": {
+                "pack_format": pack_format,
+                "min_format": min_format,
+                "max_format": max_format,
+                "description": desc,
+                "supported_formats": supported_formats
+            }
+        })
+    } else {
+        // New format (1.21.9+): use min_format and max_format only
+        serde_json::json!({
+            "pack": {
+                "min_format": min_format,
+                "max_format": max_format,
+                "description": desc
+            }
+        })
+    };
+    
     serde_json::to_string_pretty(&meta).unwrap_or_else(|_| {
-        "{\"pack\":{\"pack_format\":1,\"description\":\"resource_merger\"}}".to_string()
+        "{\"pack\":{\"min_format\":1,\"max_format\":1,\"description\":\"resource_merger\"}}".to_string()
     })
 }
 
