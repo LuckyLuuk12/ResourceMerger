@@ -223,23 +223,21 @@ pub fn merge_packs_to_bytes_with_options(
                 }
                 read_zipbytes_into_map(b, &mut files)?;
             }
-            PackInput::Url(u) => {
-                match fetch_url_bytes(u) {
-                    Ok(bytes) => {
-                        if let Some(n) = peek_pack_format_from_zipbytes(&bytes) {
-                            found_formats.push(n);
-                        }
-                        read_zipbytes_into_map(&bytes, &mut files)?;
+            PackInput::Url(u) => match fetch_url_bytes(u) {
+                Ok(bytes) => {
+                    if let Some(n) = peek_pack_format_from_zipbytes(&bytes) {
+                        found_formats.push(n);
                     }
-                    Err(e) => {
-                        if opts.tolerate_missing_inputs {
-                            eprintln!("warning: skipping input {}: {}", u, e);
-                        } else {
-                            return Err(e);
-                        }
+                    read_zipbytes_into_map(&bytes, &mut files)?;
+                }
+                Err(e) => {
+                    if opts.tolerate_missing_inputs {
+                        eprintln!("warning: skipping input {}: {}", u, e);
+                    } else {
+                        return Err(e);
                     }
                 }
-            }
+            },
         }
     }
 
@@ -709,17 +707,17 @@ fn make_pack_mcmeta(
             env!("CARGO_PKG_VERSION")
         )
     });
-    
+
     // Threshold for backwards compatibility: resource pack format < 65 requires old format
     const OLD_FORMAT_THRESHOLD: u32 = 65;
-    
+
     // Determine min and max from supported_formats array
     let min_format = supported_formats.first().copied().unwrap_or(pack_format);
     let max_format = supported_formats.last().copied().unwrap_or(pack_format);
-    
+
     // Check if we need backwards compatibility fields (if min_format < 65)
     let needs_old_format = min_format < OLD_FORMAT_THRESHOLD;
-    
+
     let meta = if needs_old_format {
         // Old format: include pack_format and supported_formats for backwards compatibility
         serde_json::json!({
@@ -741,9 +739,10 @@ fn make_pack_mcmeta(
             }
         })
     };
-    
+
     serde_json::to_string_pretty(&meta).unwrap_or_else(|_| {
-        "{\"pack\":{\"min_format\":1,\"max_format\":1,\"description\":\"resource_merger\"}}".to_string()
+        "{\"pack\":{\"min_format\":1,\"max_format\":1,\"description\":\"resource_merger\"}}"
+            .to_string()
     })
 }
 
@@ -751,7 +750,10 @@ fn default_pack_png_bytes() -> Vec<u8> {
     // Include the default 64x64 pack image binary at compile time. This uses the
     // provided PNG file `assets/default-pack-64.png` and embeds its bytes into
     // the binary so we can always write `pack.png` when inputs don't provide one.
-    const BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/default-pack-64.png"));
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/default-pack-64.png"
+    ));
     BYTES.to_vec()
 }
 
