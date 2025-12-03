@@ -7,8 +7,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-// ...existing code...
-// ...existing code...
 use thiserror::Error;
 use walkdir::WalkDir;
 use zip::{ZipArchive, ZipWriter};
@@ -197,8 +195,11 @@ pub fn merge_packs_to_bytes_with_options(
 ) -> Result<Vec<u8>> {
     // We'll maintain a map of path -> file bytes. Later packs overwrite earlier ones.
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
-    // Track pack_format numbers found in inputs so we can synthesize a sensible pack.mcmeta
+    // Track pack_format and max_format numbers found in inputs
     let mut found_formats: Vec<u32> = Vec::new();
+    let mut found_max_formats: Vec<u32> = Vec::new();
+    // Collect overlays from all packs (later packs overwrite earlier ones)
+    let mut overlays_values: Vec<serde_json::Value> = Vec::new();
 
     // First, inspect each input for pack.mcmeta to collect pack_format values across all inputs.
     // We do a best-effort peek so we can choose the HIGHEST pack_format observed, independent
@@ -206,27 +207,51 @@ pub fn merge_packs_to_bytes_with_options(
     for pack in packs {
         match pack {
             PackInput::Dir(p) => {
-                if let Some(n) = peek_pack_format_from_dir(p) {
-                    found_formats.push(n);
+                if let Some((pf, mf, overlays)) = peek_pack_format_from_dir(p) {
+                    found_formats.push(pf);
+                    if let Some(max) = mf {
+                        found_max_formats.push(max);
+                    }
+                    if let Some(ov) = overlays {
+                        overlays_values.push(ov);
+                    }
                 }
                 read_dir_into_map(p, &mut files)?;
             }
             PackInput::ZipFile(p) => {
-                if let Some(n) = peek_pack_format_from_zipfile(p) {
-                    found_formats.push(n);
+                if let Some((pf, mf, overlays)) = peek_pack_format_from_zipfile(p) {
+                    found_formats.push(pf);
+                    if let Some(max) = mf {
+                        found_max_formats.push(max);
+                    }
+                    if let Some(ov) = overlays {
+                        overlays_values.push(ov);
+                    }
                 }
                 read_zipfile_into_map(p, &mut files)?;
             }
             PackInput::ZipBytes(b) => {
-                if let Some(n) = peek_pack_format_from_zipbytes(b) {
-                    found_formats.push(n);
+                if let Some((pf, mf, overlays)) = peek_pack_format_from_zipbytes(b) {
+                    found_formats.push(pf);
+                    if let Some(max) = mf {
+                        found_max_formats.push(max);
+                    }
+                    if let Some(ov) = overlays {
+                        overlays_values.push(ov);
+                    }
                 }
                 read_zipbytes_into_map(b, &mut files)?;
             }
             PackInput::Url(u) => match fetch_url_bytes(u) {
                 Ok(bytes) => {
-                    if let Some(n) = peek_pack_format_from_zipbytes(&bytes) {
-                        found_formats.push(n);
+                    if let Some((pf, mf, overlays)) = peek_pack_format_from_zipbytes(&bytes) {
+                        found_formats.push(pf);
+                        if let Some(max) = mf {
+                            found_max_formats.push(max);
+                        }
+                        if let Some(ov) = overlays {
+                            overlays_values.push(ov);
+                        }
                     }
                     read_zipbytes_into_map(&bytes, &mut files)?;
                 }
@@ -242,11 +267,15 @@ pub fn merge_packs_to_bytes_with_options(
     }
 
     // Inspect any pack.mcmeta files found and collect pack_format values
+    // (overlays are now collected during the peek phase above)
     for (k, v) in &files {
         if k == "pack.mcmeta" || k.ends_with("/pack.mcmeta") {
             if let Ok(s) = std::str::from_utf8(v) {
-                if let Ok(vn) = extract_pack_format_from_mcmeta(s) {
-                    found_formats.push(vn);
+                if let Ok((pf, mf)) = extract_pack_format_from_mcmeta(s) {
+                    found_formats.push(pf);
+                    if let Some(max) = mf {
+                        found_max_formats.push(max);
+                    }
                 }
             }
         }
@@ -331,11 +360,23 @@ pub fn merge_packs_to_bytes_with_options(
         }
     };
 
+    // Determine actual max format from all sources
+    let actual_max_format = if found_max_formats.is_empty() {
+        *supported_formats.last().unwrap_or(&final_pack_fmt)
+    } else {
+        *found_max_formats.iter().max().unwrap_or(&final_pack_fmt)
+    };
+
+    // Merge overlays: later ones overwrite earlier, keyed by directory name
+    let merged_overlays = merge_overlays(&overlays_values);
+
     // Ensure pack.mcmeta exists with an appropriate pack_format & supported_formats
     let mcmeta = make_pack_mcmeta(
         final_pack_fmt,
         &supported_formats,
         opts.description_override.as_deref(),
+        actual_max_format,
+        merged_overlays.as_ref(),
     );
     zip.start_file("pack.mcmeta", options.clone())?;
     zip.write_all(mcmeta.as_bytes())?;
@@ -615,14 +656,18 @@ fn sanitize_zip_entry_name(name: &str) -> Option<String> {
 }
 
 // Peek functions: try to locate pack.mcmeta and extract pack_format without reading all files.
-fn peek_pack_format_from_zipbytes(bytes: &[u8]) -> Option<u32> {
+// Returns (pack_format, max_format_option, overlays_option)
+fn peek_pack_format_from_zipbytes(
+    bytes: &[u8],
+) -> Option<(u32, Option<u32>, Option<serde_json::Value>)> {
     let cursor = Cursor::new(bytes);
     if let Ok(mut archive) = ZipArchive::new(cursor) {
         if let Ok(mut file) = archive.by_name("pack.mcmeta") {
             let mut buf = String::new();
             if file.read_to_string(&mut buf).is_ok() {
-                if let Ok(n) = extract_pack_format_from_mcmeta(&buf) {
-                    return Some(n);
+                if let Ok(formats) = extract_pack_format_from_mcmeta(&buf) {
+                    let overlays = extract_overlays_from_mcmeta(&buf);
+                    return Some((formats.0, formats.1, overlays));
                 }
             }
         }
@@ -630,14 +675,17 @@ fn peek_pack_format_from_zipbytes(bytes: &[u8]) -> Option<u32> {
     None
 }
 
-fn peek_pack_format_from_zipfile(path: &Path) -> Option<u32> {
+fn peek_pack_format_from_zipfile(
+    path: &Path,
+) -> Option<(u32, Option<u32>, Option<serde_json::Value>)> {
     if let Ok(f) = File::open(path) {
         if let Ok(mut archive) = ZipArchive::new(f) {
             if let Ok(mut file) = archive.by_name("pack.mcmeta") {
                 let mut buf = String::new();
                 if file.read_to_string(&mut buf).is_ok() {
-                    if let Ok(n) = extract_pack_format_from_mcmeta(&buf) {
-                        return Some(n);
+                    if let Ok(formats) = extract_pack_format_from_mcmeta(&buf) {
+                        let overlays = extract_overlays_from_mcmeta(&buf);
+                        return Some((formats.0, formats.1, overlays));
                     }
                 }
             }
@@ -646,23 +694,69 @@ fn peek_pack_format_from_zipfile(path: &Path) -> Option<u32> {
     None
 }
 
-fn peek_pack_format_from_dir(dir: &Path) -> Option<u32> {
+fn peek_pack_format_from_dir(dir: &Path) -> Option<(u32, Option<u32>, Option<serde_json::Value>)> {
     let p = dir.join("pack.mcmeta");
     if p.is_file() {
         if let Ok(s) = std::fs::read_to_string(p) {
-            if let Ok(n) = extract_pack_format_from_mcmeta(&s) {
-                return Some(n);
+            if let Ok(formats) = extract_pack_format_from_mcmeta(&s) {
+                let overlays = extract_overlays_from_mcmeta(&s);
+                return Some((formats.0, formats.1, overlays));
             }
         }
     }
     None
 }
 
-/// Try to extract a single pack_format number from a pack.mcmeta JSON string.
-fn extract_pack_format_from_mcmeta(s: &str) -> std::result::Result<u32, ()> {
-    // Quick and tolerant parser: look for "pack_format" as a number or numeric string.
-    // Accept both the common shape { "pack": { "pack_format": N } } and a rare
-    // top-level { "pack_format": N }.
+/// Extract overlays section from a pack.mcmeta JSON string.
+fn extract_overlays_from_mcmeta(s: &str) -> Option<serde_json::Value> {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
+        if let Some(overlays) = json.get("overlays") {
+            return Some(overlays.clone());
+        }
+    }
+    None
+}
+
+/// Merge overlays from multiple pack.mcmeta files.
+/// Later overlays overwrite earlier ones based on directory name.
+fn merge_overlays(overlays_list: &[serde_json::Value]) -> Option<serde_json::Value> {
+    if overlays_list.is_empty() {
+        return None;
+    }
+
+    // Collect all overlay entries, keyed by directory name (later overwrites earlier)
+    let mut merged_entries: HashMap<String, serde_json::Value> = HashMap::new();
+
+    for overlay_val in overlays_list {
+        if let Some(entries_arr) = overlay_val.get("entries").and_then(|v| v.as_array()) {
+            for entry in entries_arr {
+                if let Some(dir) = entry.get("directory").and_then(|v| v.as_str()) {
+                    merged_entries.insert(dir.to_string(), entry.clone());
+                }
+            }
+        }
+    }
+
+    if merged_entries.is_empty() {
+        return None;
+    }
+
+    // Convert back to array, sorted by directory name for determinism
+    let mut sorted_entries: Vec<_> = merged_entries.into_iter().collect();
+    sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let entries_array: Vec<serde_json::Value> =
+        sorted_entries.into_iter().map(|(_, v)| v).collect();
+
+    Some(serde_json::json!({
+        "entries": entries_array
+    }))
+}
+
+/// Try to extract pack_format and max_format from a pack.mcmeta JSON string.
+/// Returns (pack_format, max_format) where max_format might be higher than pack_format.
+fn extract_pack_format_from_mcmeta(s: &str) -> std::result::Result<(u32, Option<u32>), ()> {
+    // Quick and tolerant parser: look for "pack_format", "max_format", and "supported_formats".
+    // Accept both the common shape { "pack": { ... } } and rare top-level fields.
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
         // helper to extract numeric from a Value
         let try_from_value = |val: &serde_json::Value| -> Option<u32> {
@@ -677,20 +771,46 @@ fn extract_pack_format_from_mcmeta(s: &str) -> std::result::Result<u32, ()> {
             None
         };
 
-        // Check common shape: { "pack": { "pack_format": ... } }
+        let mut pack_format = None;
+        let mut max_format = None;
+
+        // Check common shape: { "pack": { ... } }
         if let Some(pack) = v.get("pack") {
             if let Some(fmt) = pack.get("pack_format") {
-                if let Some(n) = try_from_value(fmt) {
-                    return Ok(n);
+                pack_format = try_from_value(fmt);
+            }
+
+            // Look for explicit max_format
+            if let Some(mf) = pack.get("max_format") {
+                max_format = try_from_value(mf);
+            }
+
+            // Also check supported_formats for max_inclusive
+            if let Some(sf) = pack.get("supported_formats") {
+                if let Some(obj) = sf.as_object() {
+                    if let Some(max_inc) = obj.get("max_inclusive") {
+                        if let Some(n) = try_from_value(max_inc) {
+                            max_format = Some(n);
+                        }
+                    }
                 }
             }
         }
 
-        // Fallback: top-level pack_format
-        if let Some(fmt) = v.get("pack_format") {
-            if let Some(n) = try_from_value(fmt) {
-                return Ok(n);
+        // Fallback: check top-level pack_format and max_format
+        if pack_format.is_none() {
+            if let Some(fmt) = v.get("pack_format") {
+                pack_format = try_from_value(fmt);
             }
+        }
+        if max_format.is_none() {
+            if let Some(mf) = v.get("max_format") {
+                max_format = try_from_value(mf);
+            }
+        }
+
+        if let Some(pf) = pack_format {
+            return Ok((pf, max_format));
         }
     }
     Err(())
@@ -700,6 +820,8 @@ fn make_pack_mcmeta(
     pack_format: u32,
     supported_formats: &[u32],
     description: Option<&str>,
+    max_format: u32,
+    overlays: Option<&serde_json::Value>,
 ) -> String {
     let desc = description.map(|s| s.to_string()).unwrap_or_else(|| {
         format!(
@@ -711,14 +833,13 @@ fn make_pack_mcmeta(
     // Threshold for backwards compatibility: resource pack format < 65 requires old format
     const OLD_FORMAT_THRESHOLD: u32 = 65;
 
-    // Determine min and max from supported_formats array
+    // Determine min from supported_formats array
     let min_format = supported_formats.first().copied().unwrap_or(pack_format);
-    let max_format = supported_formats.last().copied().unwrap_or(pack_format);
 
     // Check if we need backwards compatibility fields (if min_format < 65)
     let needs_old_format = min_format < OLD_FORMAT_THRESHOLD;
 
-    let meta = if needs_old_format {
+    let mut meta = if needs_old_format {
         // Old format: include pack_format and supported_formats for backwards compatibility
         serde_json::json!({
             "pack": {
@@ -740,7 +861,15 @@ fn make_pack_mcmeta(
         })
     };
 
-    serde_json::to_string_pretty(&meta).unwrap_or_else(|_| {
+    // Add overlays if present
+    if let Some(overlays_val) = overlays {
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("overlays".to_string(), overlays_val.clone());
+        }
+    }
+
+    // Use compact JSON (single-line) for smaller file size - Minecraft supports this
+    serde_json::to_string(&meta).unwrap_or_else(|_| {
         "{\"pack\":{\"min_format\":1,\"max_format\":1,\"description\":\"resource_merger\"}}"
             .to_string()
     })
