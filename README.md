@@ -13,7 +13,7 @@ A small, practical Rust library and CLI for merging Minecraft resource packs (fo
 
 ```toml
 [dependencies]
-resource_merger = "0.1.2"
+resource_merger = "0.1"
 ```
 
 ## Examples
